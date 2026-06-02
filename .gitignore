@@ -15,6 +15,9 @@ venv/
 .env.bak.*
 !.env.example
 
+# Portable Ollama binaries (models stay under data/ollama/, already ignored)
+ollama/
+
 # Data — all user data stays local
 data/
 !services/hwfit/data/
