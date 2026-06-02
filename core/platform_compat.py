@@ -171,6 +171,12 @@ def _windows_bash_fallbacks() -> List[str]:
     return paths
 
 
+def _windows_bash_is_wsl_stub(path: str) -> bool:
+    """True for system32/bash.exe — the WSL launcher, not a real shell."""
+    norm = os.path.normcase(os.path.normpath(path))
+    return norm.endswith(os.path.normcase(os.path.join("system32", "bash.exe")))
+
+
 def find_bash() -> Optional[str]:
     """Locate a real ``bash`` interpreter, or None.
 
@@ -184,13 +190,18 @@ def find_bash() -> Optional[str]:
         return _BASH_CACHE
     _BASH_PROBED = True
     found = which_tool("bash")
-    if not found and IS_WINDOWS:
+    if IS_WINDOWS:
         for cand in _windows_bash_fallbacks():
             if os.path.exists(cand):
-                found = cand
-                break
+                _BASH_CACHE = cand
+                return _BASH_CACHE
+        if found and not _windows_bash_is_wsl_stub(found):
+            _BASH_CACHE = found
+        else:
+            _BASH_CACHE = None
+        return _BASH_CACHE
     _BASH_CACHE = found
-    return found
+    return _BASH_CACHE
 
 
 def has_bash() -> bool:
