@@ -12,6 +12,10 @@ import threading
 from datetime import datetime, timedelta
 from typing import Dict, Any, Optional
 from fastapi import HTTPException, UploadFile
+
+from src.upload_limits import format_byte_limit, get_chat_upload_max_bytes
+
+
 def secure_filename(filename: str) -> str:
     """Sanitize a filename (replaces werkzeug.utils.secure_filename)."""
     import unicodedata
@@ -73,7 +77,7 @@ class UploadHandler:
     def __init__(self, base_dir: str, upload_dir: str):
         self.base_dir = base_dir
         self.upload_dir = upload_dir
-        self.max_upload_size = 10 * 1024 * 1024  # 10MB
+        self.max_upload_size = get_chat_upload_max_bytes()
         self.max_concurrent_uploads = 3
         self.cleanup_days = 30
         # Per-IP per-minute cap. save_upload() counts EACH file, and the chat
@@ -108,6 +112,10 @@ class UploadHandler:
         except Exception:
             self.file_detector = None
             logger.warning("python-magic not available, falling back to basic detection")
+
+        # In-memory index cache to avoid O(N) disk I/O on every request
+        self._index_cache: Optional[Dict[str, Any]] = None
+        self._index_mtime: float = 0.0
     
     def inside_base_dir(self, path: str) -> bool:
         """Check if path is inside base directory"""
@@ -313,6 +321,13 @@ class UploadHandler:
                 except OSError:
                     pass
             os.replace(tmp, path)
+            # Update cache if this is the main index
+            if path.endswith("uploads.json"):
+                self._index_cache = data
+                try:
+                    self._index_mtime = os.path.getmtime(path)
+                except OSError:
+                    self._index_mtime = time.time()
         except Exception:
             try:
                 os.unlink(tmp)
@@ -321,22 +336,40 @@ class UploadHandler:
             raise
 
     def _load_upload_index(self) -> Dict[str, Any]:
+        """Load the upload index from disk/cache. Uses mtime-based validation
+        to avoid redundant parsing on hot paths.
+        """
         uploads_db_path = os.path.join(self.upload_dir, "uploads.json")
         if not os.path.exists(uploads_db_path):
+            self._index_cache = {}
+            self._index_mtime = 0.0
             return {}
+
+        # Check cache validity
+        try:
+            mtime = os.path.getmtime(uploads_db_path)
+            if self._index_cache is not None and mtime <= self._index_mtime:
+                return self._index_cache
+        except OSError:
+            mtime = 0.0
+
         # Try the live file first, fall back to the .bak sibling if the
-        # live file is truncated/corrupted (e.g. a previous writer was
-        # SIGKILL'd mid-rename before the new code path was deployed).
+        # live file is truncated/corrupted.
         for candidate in (uploads_db_path, uploads_db_path + ".bak"):
             if not os.path.exists(candidate):
                 continue
             try:
                 with open(candidate, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                return data if isinstance(data, dict) else {}
+                if isinstance(data, dict):
+                    self._index_cache = data
+                    self._index_mtime = mtime
+                    return data
             except Exception as e:
                 logger.warning(f"Failed to read uploads database ({candidate}): {e}")
                 continue
+
+        self._index_cache = {}
         return {}
 
     def get_upload_info(self, upload_id: str) -> Optional[Dict[str, Any]]:
@@ -347,6 +380,95 @@ class UploadHandler:
             if isinstance(info, dict) and info.get("id") == upload_id:
                 return dict(info)
         return None
+
+    def _renamed_upload_index_key(self, key: str, info: Dict[str, Any], old_owner: str, new_owner: str) -> str:
+        """Return the storage key to use after renaming an owned upload row.
+
+        Harden against usernames with colons by using the explicit metadata
+        fields instead of trying to parse the key string.
+        """
+        file_hash = info.get("hash")
+        if file_hash:
+            return f"{new_owner}:{file_hash}"
+
+        # Fallback for rows without an explicit hash (should not happen in modern Odysseus)
+        if isinstance(key, str) and ":" in key:
+            # Join all but the last part if there are multiple colons
+            parts = key.rsplit(":", 1)
+            if len(parts) == 2:
+                owner_part, rest = parts[0], parts[1]
+                if owner_part.strip().lower() == old_owner.strip().lower():
+                    return f"{new_owner}:{rest}"
+        return key
+
+    def _unique_upload_index_key(self, base_key: str, used_keys: set, reserved_keys: set, info: Dict[str, Any]) -> str:
+        """Choose a deterministic collision key without overwriting an existing row."""
+        if base_key not in used_keys and base_key not in reserved_keys:
+            return base_key
+
+        upload_id = str(info.get("id") or "renamed").strip() or "renamed"
+        candidate = f"{base_key}:{upload_id}"
+        if candidate not in used_keys and candidate not in reserved_keys:
+            return candidate
+
+        index = 2
+        while True:
+            candidate = f"{base_key}:{upload_id}:{index}"
+            if candidate not in used_keys and candidate not in reserved_keys:
+                return candidate
+            index += 1
+
+    def rename_owner(self, old_owner: str, new_owner: str) -> int:
+        """Rename upload metadata ownership from old_owner to new_owner.
+
+        Upload rows are keyed by owner-qualified hashes for dedupe and also
+        carry an `owner` field for access checks. Both must move together when
+        usernames change.
+        """
+        old_owner_normalized = str(old_owner or "").strip().lower()
+        new_owner = str(new_owner or "").strip()
+        if not old_owner_normalized or not new_owner:
+            return 0
+        if old_owner_normalized == new_owner.lower():
+            return 0
+
+        uploads_db_path = os.path.join(self.upload_dir, "uploads.json")
+        with self._index_lock:
+            current = self._load_upload_index()
+            if not current:
+                return 0
+
+            updated = {}
+            renamed = 0
+            original_keys = set(current.keys())
+
+            for key, info in current.items():
+                new_key = key
+                new_info = info
+                if isinstance(info, dict) and str(info.get("owner", "")).strip().lower() == old_owner_normalized:
+                    new_info = dict(info)
+                    new_info["owner"] = new_owner
+                    base_key = self._renamed_upload_index_key(key, new_info, old_owner_normalized, new_owner)
+                    new_key = self._unique_upload_index_key(
+                        base_key,
+                        set(updated.keys()),
+                        original_keys - {key},
+                        new_info,
+                    )
+                    if new_key != base_key:
+                        logger.warning(
+                            "Upload owner rename key collision for %s -> %s at %s; preserving row as %s",
+                            old_owner_normalized,
+                            new_owner,
+                            base_key,
+                            new_key,
+                        )
+                    renamed += 1
+                updated[new_key] = new_info
+
+            if renamed:
+                self._atomic_write_json(uploads_db_path, updated)
+            return renamed
 
     def _find_upload_path(self, upload_id: str) -> Optional[str]:
         """Find an upload file by ID while staying inside upload_dir."""
@@ -459,11 +581,8 @@ class UploadHandler:
             total_size = 0
             file_types = {}
             
-            uploads_db_path = os.path.join(self.upload_dir, "uploads.json")
-            if os.path.exists(uploads_db_path):
-                with open(uploads_db_path, "r", encoding="utf-8") as f:
-                    files = json.load(f)
-                
+            files = self._load_upload_index()
+            if files:
                 total_files = len(files)
                 for file_info in files.values():
                     total_size += file_info.get("size", 0)
@@ -518,7 +637,7 @@ class UploadHandler:
         if file_size > self.max_upload_size:
             raise HTTPException(
                 status_code=400,
-                detail=f"File size exceeds {self.max_upload_size/1024/1024}MB limit"
+                detail=f"File size exceeds {format_byte_limit(self.max_upload_size)} limit"
             )
         
         # Get original filename and sanitize it

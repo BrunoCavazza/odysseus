@@ -14,8 +14,18 @@ from typing import Optional
 
 from src.agent_tools import ToolBlock, TOOL_TAGS
 from src.tool_parsing import _TOOL_NAME_MAP
+from src.tool_security import BUILTIN_EMAIL_TOOLS
 
 logger = logging.getLogger(__name__)
+
+
+_REQUIRED_NATIVE_TOOL_ARGS = {
+    "web_search": ("query", "queries"),
+    "web_fetch": ("url",),
+    "read_file": ("path",),
+    "write_file": ("path",),
+    "edit_file": ("path",),
+}
 
 # ---------------------------------------------------------------------------
 # OpenAI-compatible function tool schemas
@@ -25,7 +35,7 @@ FUNCTION_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "bash",
-            "description": "Run a shell command (full access)",
+            "description": "Run a shell command (full access). Prefer a dedicated tool whenever one fits the job (reading, writing, editing, searching, or listing files); use bash only for what no dedicated tool covers (installs, git, builds, running programs, system info). Do NOT create or edit files via bash redirects/heredocs/sed -- use the dedicated file tools.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -39,7 +49,7 @@ FUNCTION_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "python",
-            "description": "Execute Python code to compute a result or test something",
+            "description": "Execute Python code to compute a result or test something. Prefer a dedicated tool whenever one fits the job (reading, writing, or searching files); use python only for computation, data processing, or scripting no dedicated tool covers.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -68,11 +78,12 @@ FUNCTION_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "web_fetch",
-            "description": "Fetch and read the text content of a specific URL the user names (e.g. 'check example.com', 'what's on this page <url>'). Use when you already have a concrete URL/domain. NOT for open-ended searches (use web_search) or 'research X' jobs (use trigger_research).",
+            "description": "Fetch and read the text content of a specific URL the user names (e.g. 'check example.com', 'what's on this page <url>'). Use when you already have a concrete URL/domain. NOT for open-ended searches (use web_search) or 'research X' jobs (use trigger_research). Downloads are size-budgeted; a '[partial content: ...]' notice in the result means the body was cut short and you can re-call with full=true for the rest.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "url": {"type": "string", "description": "The URL or domain to fetch (http/https; a bare domain like example.com is fine)"}
+                    "url": {"type": "string", "description": "The URL or domain to fetch (http/https; a bare domain like example.com is fine)"},
+                    "full": {"type": "boolean", "description": "Raise the download budget to the hard cap for large pages/files. Use only after a result reported partial content."}
                 },
                 "required": ["url"]
             }
@@ -82,14 +93,71 @@ FUNCTION_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Read a file from disk",
+            "description": "Read a file from disk. Optionally read a line range with offset/limit for large files.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "File path to read"}
+                    "path": {"type": "string", "description": "File path to read"},
+                    "offset": {"type": "integer", "description": "1-based line to start reading from (optional)"},
+                    "limit": {"type": "integer", "description": "Max number of lines to read from offset (optional)"}
                 },
                 "required": ["path"]
             }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "grep",
+            "description": "Search file contents for a regular expression across a directory tree (uses ripgrep when available, respecting .gitignore). Returns file:line:match. PREFER this over `bash grep/rg` for code search — confined to the allowed roots, structured output.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "description": "Regular expression to search for"},
+                    "path": {"type": "string", "description": "Directory or file to search (optional; defaults to the project root)"},
+                    "glob": {"type": "string", "description": "Only search files matching this glob, e.g. '*.py' (optional)"},
+                    "ignore_case": {"type": "boolean", "description": "Case-insensitive match (optional)"},
+                    "max_results": {"type": "integer", "description": "Max matches to return (optional)"}
+                },
+                "required": ["pattern"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "glob",
+            "description": "Find files by glob pattern (recursive), newest first. e.g. '**/*.py'. PREFER this over `bash find/ls` for locating files — confined to the allowed roots.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "description": "Glob pattern, e.g. '**/*.ts' or 'src/**/test_*.py'"},
+                    "path": {"type": "string", "description": "Base directory (optional; defaults to the project root)"}
+                },
+                "required": ["pattern"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "ls",
+            "description": "List the entries of a directory (folders first, then files with sizes). PREFER this over `bash ls` — confined to the allowed roots.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Directory to list (optional; defaults to the project root)"}
+                },
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_workspace",
+            "description": "Return the absolute path of the active workspace folder the user is working in. File tools are confined to it; the shell starts there but is not sandboxed. Call this first when the user refers to 'the project'/'the code'/'this folder' without a path, instead of asking them. Takes no arguments.",
+            "parameters": {"type": "object", "properties": {}, "required": []}
         }
     },
     {
@@ -110,8 +178,25 @@ FUNCTION_TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
+            "name": "edit_file",
+            "description": "Edit a file ON DISK by exact string replacement (home folder, project files, any real path like ~/sweden.txt or /path/to/file). This is the right tool for files on disk — NOT edit_document (that's for editor-panel documents). PREFER this over bash (sed/echo) — it shows a diff. old_string must match the file exactly and be unique (or set replace_all). Use write_file to create a new file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File path to edit"},
+                    "old_string": {"type": "string", "description": "Exact text to replace (must match the file, including indentation)"},
+                    "new_string": {"type": "string", "description": "Replacement text"},
+                    "replace_all": {"type": "boolean", "description": "Replace all occurrences instead of requiring a unique match"}
+                },
+                "required": ["path", "old_string", "new_string"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "create_document",
-            "description": "Create a new document in the editor panel. Use this when the user asks to write, create, build, or generate code, scripts, programs, games, apps, or any substantial content (>15 lines) AND there is no already-open document/email draft that the request refers to. If an email compose draft is open, edit that draft instead of creating another document. NEVER put large code blocks directly in chat — use this tool instead.",
+            "description": "Create a new document in the editor panel. Use this when the user asks to write, create, build, make, or generate code, scripts, programs, games, apps, or any long-form or structured content that is more than a short paragraph, AND there is no already-open document/email draft that the request refers to. If an email compose draft is open, edit that draft instead of creating another document. NEVER put large generated content directly in chat — use this tool instead.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -127,7 +212,7 @@ FUNCTION_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "edit_document",
-            "description": "PREFERRED way to change an existing document. Targeted find-and-replace with multiple FIND/REPLACE pairs per call. Use this for any edit smaller than a full rewrite: adding a function, fixing a bug, tweaking a section, renaming things. Do NOT send the whole file back via update_document for small edits — it wastes tokens and is hard to review.",
+            "description": "Edit a document OPEN IN THE EDITOR PANEL (created via create_document) — NOT a file on disk. For files on disk (home folder, project files, anything with a path like ~/x.txt or /path/to/file) use edit_file instead. Targeted find-and-replace with multiple FIND/REPLACE pairs per call; use for any edit smaller than a full rewrite. Do NOT send the whole file back via update_document for small edits.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -192,7 +277,7 @@ FUNCTION_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "search_chats",
-            "description": "Search the user's past chat conversations by keyword. Use when the user asks about previous chats, past conversations, or wants to find a discussion they had before. Returns matching sessions with clickable links.",
+            "description": "Search the user's past session transcripts by keyword. Use when the user asks about previous chats, past conversations, or when direct transcript evidence is better than persistent memory. Returns matching sessions with clickable links and nearby context.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -250,7 +335,7 @@ FUNCTION_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "send_to_session",
-            "description": "Send a message to an existing chat and get the model's response. The chat keeps its conversation history.",
+            "description": "Send a new message to an existing live chat and get that chat model's response. Do not use this to retrieve, read, summarize, or inspect old chats; use search_chats or list_sessions for past chat evidence.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -340,7 +425,7 @@ FUNCTION_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "ui_control",
-            "description": "Control the user interface. Actions: toggle (turn tools on/off), open_panel (open a modal: documents/library, gallery, email, sessions, notes, memories/brain, skills, settings, cookbook), open_email_reply (open an email reply draft document; does NOT send), set_mode, switch_model, set_theme (presets: dark, light, midnight, paper, nord, monokai, gruvbox, dracula, cyberpunk, retrowave, forest, ocean, ume, copper, terminal, vaporwave, lavender, gpt, coffee, claude), create_theme (CREATE any custom theme with a name + colors object — pick distinctive, evocative hex colors that match the requested aesthetic, NOT generic defaults. The theme auto-applies after creation). When a user asks for ANY theme not in the preset list, ALWAYS use create_theme.",
+            "description": "Control the user interface. Actions: toggle (turn tools on/off), open_panel (open a modal: documents/library, gallery, email, sessions, notes, memories/brain, skills, settings, cookbook), open_email_reply (open an email reply draft document; DOES NOT send. For 'write/draft a reply saying X', include body with the drafted reply), set_mode, switch_model, set_theme (built-in presets: dark, light, midnight, paper, cyberpunk, retrowave, forest, ocean, ume, copper, terminal, organs, lavender, gpt, claude, cute), create_theme (CREATE any custom theme with a name + colors object — pick distinctive, evocative hex colors that match the requested aesthetic, NOT generic defaults. The theme auto-applies after creation). When a user asks for ANY theme not in the built-in preset list, ALWAYS use create_theme.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -351,6 +436,7 @@ FUNCTION_TOOL_SCHEMAS = [
                     "uid": {"type": "string", "description": "Email UID for open_email_reply"},
                     "folder": {"type": "string", "description": "Email folder for open_email_reply (default INBOX)"},
                     "mode": {"type": "string", "description": "Reply draft mode for open_email_reply: reply, reply-all, or ai-reply"},
+                    "body": {"type": "string", "description": "For open_email_reply: reply body to pre-fill. Required whenever the user told you what the reply should say. Opens a draft, does not send."},
                     "colors": {"type": "object", "description": "For create_theme: the theme colors",
                                "properties": {
                                    "bg": {"type": "string", "description": "Background color (hex, e.g. #1a1a2e)"},
@@ -378,6 +464,47 @@ FUNCTION_TOOL_SCHEMAS = [
                                "required": ["bg", "fg", "panel", "border", "accent"]}
                 },
                 "required": ["action"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "ask_user",
+            "description": "Ask the user a multiple-choice question to get a decision or clarification when the task is genuinely ambiguous and the answer changes what you do next (e.g. pick between approaches, confirm an assumption, choose a target). The user sees clickable option buttons; calling this ENDS your turn and their selection arrives as your next message. Prefer sensible defaults over asking — only ask when you truly cannot proceed well without the user's input. Do NOT use it to confirm irreversible/destructive actions that have a dedicated confirmation flow.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string", "description": "The question to ask. Be specific and self-contained."},
+                    "options": {
+                        "type": "array",
+                        "description": "2-6 choices. Each is an object with a short `label` and an optional `description` explaining the trade-off.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "label": {"type": "string", "description": "Concise choice text the user clicks (1-5 words)."},
+                                "description": {"type": "string", "description": "Optional one-line explanation of this choice."}
+                            },
+                            "required": ["label"]
+                        }
+                    },
+                    "multi": {"type": "boolean", "description": "Set true ONLY when the question explicitly allows choosing more than one option. Otherwise omit it or set false. Default false."}
+                },
+                "required": ["question", "options"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_plan",
+            "description": "Write back to the ACTIVE PLAN: mark steps done or revise them. Use this while executing an approved plan — after you finish a step, call update_plan with the full checklist and that step marked `- [x]`; when the user asks to change the plan, call it with the revised checklist. The user's docked plan window updates live. Pass the COMPLETE checklist every time (not a diff). No effect if there is no active plan.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "plan": {"type": "string", "description": "The full updated plan as a GitHub-style markdown checklist — one step per line, `- [ ]` for pending and `- [x]` for done. Always send the whole list."}
+                },
+                "required": ["plan"]
             }
         }
     },
@@ -422,7 +549,7 @@ FUNCTION_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "manage_calendar",
-            "description": "Manage calendar events: list events in a date range, create, update, delete. Each event can carry a tag/category (event_type) and importance level. Resolve relative dates like today/tomorrow against the 'Current date and time' system context, then pass ISO 8601 datetimes in the user's local wall time; for all-day events set all_day=true and pass YYYY-MM-DD. For event reminders/alarms, pass reminder_minutes; the tool creates the Odysseus note reminder, so do not also call manage_notes for the same reminder.",
+            "description": "Manage calendar events: list events in a date range, create, update, delete. Each event can carry a tag/category (event_type) and importance level. Resolve relative dates like today/tomorrow against the 'Current date and time' system context, then pass ISO 8601 datetimes in the user's local wall time; for all-day events set all_day=true and pass YYYY-MM-DD. For event reminders/alarms, pass reminder_minutes; the tool creates the Odysseus note reminder, so do not also call manage_notes for the same reminder. Do not set rrule for single-occurrence requests such as 'next Wednesday only'; use rrule only when the user explicitly wants recurrence.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -438,12 +565,12 @@ FUNCTION_TOOL_SCHEMAS = [
                     "uid": {"type": "string", "description": "Event UID (for update/delete)"},
                     "calendar_href": {"type": "string", "description": "Specific calendar URL (optional; defaults to first calendar)"},
                     "calendar": {"type": "string", "description": "Filter list_events by calendar name or href"},
-                    "start": {"type": "string", "description": "list_events range start (ISO datetime); defaults to today"},
-                    "end": {"type": "string", "description": "list_events range end (ISO datetime); defaults to +14 days"},
+                    "start": {"type": "string", "description": "list_events range start (ISO datetime). Use this for month/week requests after resolving the date range; do not pass a loose query string. Prefer start; backend also accepts start_time, start_date, range_start, from, dtstart, since."},
+                    "end": {"type": "string", "description": "list_events range end (ISO datetime). Use this for month/week requests after resolving the date range; defaults to +14 days only when no range is requested. Prefer end; backend also accepts end_time, end_date, range_end, to, dtend, until."},
                     "event_type": {"type": "string", "description": "Tag / category for the event. Common values: work, personal, health, travel, meal, social, admin, other. Aliases accepted: tag, category, type."},
                     "importance": {"type": "string", "enum": ["low", "normal", "high", "critical"], "description": "Priority level (defaults to 'normal')"},
                     "reminder_minutes": {"type": "integer", "description": "For create_event: create an Odysseus reminder this many minutes before the event, e.g. 5 for 'reminder 5 min before'."},
-                    "rrule": {"type": "string", "description": "Recurrence rule in iCalendar RRULE format, e.g. 'FREQ=WEEKLY;BYDAY=MO' for weekly on Monday. Use with create_event or update_event."}
+                    "rrule": {"type": "string", "description": "Recurrence rule in iCalendar RRULE format, e.g. 'FREQ=WEEKLY;BYDAY=MO' for weekly on Monday. Use with create_event or update_event. For update_event, pass an explicit empty string to remove recurrence and make the event single-occurrence."}
                 },
                 "required": ["action"]
             }
@@ -453,14 +580,15 @@ FUNCTION_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "manage_notes",
-            "description": "Manage notes and checklists (Google Keep-style): list, add, update, delete, toggle_item. IMPORTANT: For to-do lists / checklists, set note_type='checklist' and pass the items as the `checklist_items` array — do NOT serialize them into `content` as plain text. For freeform notes, use note_type='note' and put the body in `content`. `due_date` accepts natural language like 'tomorrow at 9am' (parsed in the user's timezone) and fires a notification — do not also create a calendar event for the same reminder.",
+            "description": "Manage notes and checklists (Google Keep-style): list, view, add, update, delete, toggle_item. Use list/search to find candidate notes, then view with the note id when you need the full body. IMPORTANT: For to-do lists / checklists, set note_type='checklist' and pass the items as the `checklist_items` array — do NOT serialize them into `content` as plain text. For freeform notes, use note_type='note' and put the body in `content`. `due_date` accepts natural language like 'tomorrow at 9am' (parsed in the user's timezone) and fires a notification — do not also create a calendar event for the same reminder.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "action": {"type": "string",
-                               "enum": ["list", "add", "update", "delete", "toggle_item"],
+                               "enum": ["list", "search", "view", "add", "update", "delete", "toggle_item"],
                                "description": "The action to perform"},
                     "id": {"type": "string", "description": "Note id (for update/delete/toggle_item); 8-char prefix is fine"},
+                    "query": {"type": "string", "description": "Search text for action='search'"},
                     "title": {"type": "string", "description": "Note title (for add/update)"},
                     "content": {"type": "string", "description": "Freeform body text. Use this for note_type='note'. Do NOT use this for checklists — pass `checklist_items` instead."},
                     "note_type": {"type": "string", "enum": ["note", "checklist"],
@@ -724,6 +852,21 @@ FUNCTION_TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
+            "name": "tail_serve_output",
+            "description": "Read the last N lines of a cookbook serve/download task's tmux pane. Use ONLY in this exact sequence: (1) the user asked to serve a model, (2) you launched it via serve_model, (3) list_served_models reports the NEW task as crashed/error, (4) call tail_serve_output on the new sessionId to find the root cause, (5) call serve_model again with adjusted flags. DO NOT call this on old stopped/completed download tasks — they are historical and won't tell you anything about the current attempt. DO NOT investigate past failures before launching; the environment may have changed since.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string", "description": "Tmux session id from list_served_models (e.g. 'serve-abc12345', 'cookbook-a1b2c3d4')."},
+                    "tail": {"type": "integer", "description": "How many lines of pane scrollback to fetch (default 300, max 4000). Bump this if the error in the visible tail references an earlier line ('see root cause above')."},
+                },
+                "required": ["session_id"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "list_downloads",
             "description": "List in-progress model downloads in the Cookbook. Shows each download's model name, phase, percent (if available), session ID, and remote host.",
             "parameters": {"type": "object", "properties": {}}
@@ -828,7 +971,7 @@ FUNCTION_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "app_api",
-            "description": "Generic loopback to ANY internal Odysseus endpoint. Use this when there's no named tool for what the user wants. Hits the same routes the UI buttons hit (cookbook, gallery, library/documents, memory, notes, calendar, tasks, settings, themes, research, compare, etc.). action='endpoints' returns the OpenAPI surface (use `filter` to narrow). action='call' (default) takes method+path+body. Auth/user/admin paths are blocked for safety. Do not use for email account discovery; use list_email_accounts instead because /api/email/accounts is owner-filtered in tool context.",
+            "description": "Generic loopback to allowed internal Odysseus endpoints. Use this when there's no named tool for what the user wants. Hits the same routes the UI buttons hit (cookbook, gallery, library/documents, memory, notes, calendar, tasks, settings, themes, research, compare, etc.). action='endpoints' returns the OpenAPI surface (use `filter` to narrow). action='call' (default) takes method+path+body. Sensitive auth/user/admin/shell paths and host-control Cookbook mutation routes are blocked for safety. Do not use for shell commands; use named command tooling instead. Do not use for package installs, engine rebuilds, PID signalling, or email account discovery; use list_email_accounts for email accounts because /api/email/accounts is owner-filtered in tool context.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -878,7 +1021,7 @@ FUNCTION_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "resolve_contact",
-            "description": "Look up a contact's email address by name. Searches CardDAV address book and sent email history. Use when the user says 'message [name]' or 'email [name]' without an email address.",
+            "description": "Look up a contact by name. Searches CardDAV address book and sent email history. Returns email addresses (when available) or phone numbers. Use when the user says 'message [name]', 'email [name]', or asks for someone's contact details.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -892,7 +1035,7 @@ FUNCTION_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "manage_contact",
-            "description": "Create, update, delete, or list the user's CardDAV contacts. Use to save a new contact ('save Jonathan's email jon@x.com'), update an existing one ('change Maria's number'), or remove one. For update/delete you need the contact's uid — call action='list' first to find it. Writes go through the same dedupe + validation as the Contacts UI.",
+            "description": "Create, update, delete, or list the user's CardDAV contacts. Use to save a new contact, update an existing one (email/phone/address), or remove one. Add does not require email: name + phone or name + address is valid. For update/delete you need the contact's uid — call action='list' first to find it. Writes go through the same dedupe + validation as the Contacts UI.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -900,9 +1043,10 @@ FUNCTION_TOOL_SCHEMAS = [
                                "description": "list = show all contacts (with uids); add = create; update = edit by uid; delete = remove by uid."},
                     "uid": {"type": "string", "description": "Contact UID (required for update/delete; get it from action=list)."},
                     "name": {"type": "string", "description": "Contact's display name (for add/update)."},
-                    "email": {"type": "string", "description": "Single email address (convenience for add, or the primary email for update)."},
-                    "emails": {"type": "array", "items": {"type": "string"}, "description": "Full list of email addresses (for update; first is primary)."},
-                    "phones": {"type": "array", "items": {"type": "string"}, "description": "Full list of phone numbers (for update)."},
+                    "email": {"type": "string", "description": "Single email address (convenience for add, or the primary email for update). Optional when phone or address is provided."},
+                    "emails": {"type": "array", "items": {"type": "string"}, "description": "Full list of email addresses (first is primary)."},
+                    "phones": {"type": "array", "items": {"type": "string"}, "description": "Full list of phone numbers. Valid for add/update."},
+                    "address": {"type": "string", "description": "Postal/mailing address as a single human-readable string."},
                 },
                 "required": ["action"]
             }
@@ -974,7 +1118,7 @@ FUNCTION_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "reply_to_email",
-            "description": "SEND a reply email immediately by UID. Do not use this when the user asks to open/start a reply window or draft; use ui_control action=open_email_reply instead. For follow-up 'reply ...' requests where the user clearly wants to send now, use the exact UID from the latest read_email/list_emails result; never invent UID 1. Automatically threads with In-Reply-To/References headers.",
+            "description": "SEND a reply email immediately by UID. Do not use this when the user asks to write/draft/open/start a reply; use ui_control action=open_email_reply with body instead so the user can review. Only use when the user explicitly says to send now. Use the exact UID from the latest read_email/list_emails result; never invent UID 1. Automatically threads with In-Reply-To/References headers.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1056,6 +1200,21 @@ FUNCTION_TOOL_SCHEMAS = [
             }
         }
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "manage_bg_jobs",
+            "description": "Inspect and control detached background `bash` jobs (started with the `#!bg` marker). action='list' shows this chat's jobs with id/status/age/command; action='output' returns a job's captured output so far (use for a still-running job, or to re-read a finished one); action='kill' terminates a runaway job's process tree instead of waiting out its max-runtime. output and kill need job_id from list.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["list", "output", "kill"], "description": "list | output | kill (default: list)"},
+                    "job_id": {"type": "string", "description": "Background job id (required for output/kill; from action='list')"},
+                },
+                "required": ["action"]
+            }
+        }
+    },
 ]
 
 
@@ -1063,35 +1222,113 @@ FUNCTION_TOOL_SCHEMAS = [
 # Converter: native function call -> ToolBlock
 # ---------------------------------------------------------------------------
 
+def _decode_loose_json_string(value: str) -> str:
+    """Decode common JSON string escapes without requiring inner quotes to be escaped."""
+    out = []
+    i = 0
+    while i < len(value):
+        ch = value[i]
+        if ch != "\\" or i + 1 >= len(value):
+            out.append(ch)
+            i += 1
+            continue
+        nxt = value[i + 1]
+        if nxt == "n":
+            out.append("\n")
+        elif nxt == "r":
+            out.append("\r")
+        elif nxt == "t":
+            out.append("\t")
+        elif nxt == "b":
+            out.append("\b")
+        elif nxt == "f":
+            out.append("\f")
+        elif nxt in ('"', "\\", "/"):
+            out.append(nxt)
+        elif nxt == "u" and i + 5 < len(value):
+            try:
+                out.append(chr(int(value[i + 2:i + 6], 16)))
+                i += 4
+            except ValueError:
+                out.append("\\" + nxt)
+        else:
+            out.append("\\" + nxt)
+        i += 2
+    return "".join(out)
+
+
+def _repair_document_function_args(tool_type: str, arguments: str) -> Optional[dict]:
+    """Salvage obvious malformed document tool args from local model wrappers.
+
+    The doc LoRA sometimes emits the right native tool call but puts raw quotes
+    inside the document text, making the surrounding JSON invalid. Treat that as
+    a wrapper parse failure, not a semantic tool-choice failure.
+    """
+    if tool_type != "update_document" or not isinstance(arguments, str):
+        return None
+    raw = arguments.strip()
+    if not raw.startswith("{") or not raw.endswith("}"):
+        return None
+    for key in ("content", "conten"):
+        marker = f'"{key}"'
+        key_pos = raw.find(marker)
+        if key_pos < 0:
+            continue
+        colon_pos = raw.find(":", key_pos + len(marker))
+        if colon_pos < 0:
+            continue
+        first_quote = raw.find('"', colon_pos + 1)
+        if first_quote < 0:
+            continue
+        close_brace = raw.rfind("}")
+        last_quote = raw.rfind('"', first_quote + 1, close_brace)
+        if last_quote <= first_quote:
+            continue
+        content = _decode_loose_json_string(raw[first_quote + 1:last_quote])
+        return {"content": content}
+    return None
+
+
 def function_call_to_tool_block(name: str, arguments: str) -> Optional[ToolBlock]:
     """Convert a native function call into a ToolBlock for the existing execution pipeline."""
+    tool_type = _TOOL_NAME_MAP.get(name, name)
     try:
         if not arguments or (isinstance(arguments, str) and not arguments.strip()):
             args = {}
         else:
             args = json.loads(arguments) if isinstance(arguments, str) else arguments
     except (json.JSONDecodeError, TypeError):
-        logger.error(f"Failed to parse function call arguments for {name}: {arguments}")
-        return None
+        args = _repair_document_function_args(tool_type, arguments)
+        if args is not None:
+            logger.warning(f"Repaired malformed document function call arguments for {name}")
+        else:
+            logger.error(f"Failed to parse function call arguments for {name}: {arguments}")
+            return None
 
     # Some models emit valid JSON that isn't an object (e.g. a bare array
-    # ["ls -la"], string, or number) as the function arguments. Every branch
-    # below assumes a dict and calls args.get(...), so a non-dict would raise
-    # AttributeError and abort the whole agent stream. Coerce to {} instead.
+    # ["ls -la"], string, or number) as function arguments. Most local tools keep
+    # the legacy empty-object coercion for stream robustness, but email MCP tools
+    # must fail closed so a malformed call cannot read the default mailbox.
+    # Uses the shared BUILTIN_EMAIL_TOOLS (single source of truth) so the
+    # fail-closed set can't drift from the dispatch/blocklist sets.
     if not isinstance(args, dict):
+        if tool_type.startswith("mcp__email__") or name in BUILTIN_EMAIL_TOOLS:
+            logger.warning(f"Non-object email function call arguments for {name}: {args!r}; rejecting")
+            return None
         logger.warning(f"Non-object function call arguments for {name}: {args!r}; treating as empty")
         args = {}
 
-    tool_type = _TOOL_NAME_MAP.get(name, name)
+    required_args = _REQUIRED_NATIVE_TOOL_ARGS.get(tool_type)
+    if required_args and not any(str(args.get(key) or "").strip() for key in required_args):
+        logger.warning(f"Rejecting empty required arguments for function call {name}: {args!r}")
+        return None
 
     # Allow MCP tools through (namespaced as mcp__serverid__toolname)
     if tool_type.startswith("mcp__"):
         content = json.dumps(args) if args else "{}"
         return ToolBlock(tool_type, content)
     # Email tools are implemented as MCP — route them to email
-    _BUILTIN_EMAIL_TOOLS = {"list_email_accounts", "send_email", "list_emails", "read_email", "reply_to_email",
-                            "archive_email", "delete_email", "mark_email_read", "bulk_email", "download_attachment"}
-    if name in _BUILTIN_EMAIL_TOOLS:
+    if name in BUILTIN_EMAIL_TOOLS:
         return ToolBlock(f"mcp__email__{name}", json.dumps(args) if args else "{}")
     if tool_type not in TOOL_TAGS:
         logger.warning(f"Unknown function call: {name}")
@@ -1110,10 +1347,26 @@ def function_call_to_tool_block(name: str, arguments: str) -> Optional[ToolBlock
             content = str(queries)
         else:
             content = args.get("query", "")
+        # Preserve the model-requested freshness filter — the web_search schema
+        # advertises time_filter and the executor parses {"query","time_filter"},
+        # but a bare query string dropped it. Mirrors the read_file JSON idiom.
+        tf = args.get("time_filter")
+        if content and isinstance(tf, str) and tf in ("day", "week", "month", "year"):
+            content = json.dumps({"query": content, "time_filter": tf})
     elif tool_type == "read_file":
-        content = args.get("path", "")
+        # Plain path (back-compat) unless a line range is requested → JSON.
+        if args.get("offset") or args.get("limit"):
+            content = json.dumps(args)
+        else:
+            content = args.get("path", "")
+    elif tool_type in ("grep", "glob", "ls"):
+        content = json.dumps(args) if args else "{}"
+    elif tool_type == "get_workspace":
+        content = ""
     elif tool_type == "write_file":
         content = args.get("path", "") + "\n" + args.get("content", "")
+    elif tool_type == "edit_file":
+        content = json.dumps(args)
     elif tool_type == "create_document":
         parts = [args.get("title", "Untitled")]
         if args.get("language"):
@@ -1122,14 +1375,24 @@ def function_call_to_tool_block(name: str, arguments: str) -> Optional[ToolBlock
         content = "\n".join(parts)
     elif tool_type == "edit_document":
         blocks = []
-        for edit in args.get("edits", []):
+        edits = args.get("edits", [])
+        if not isinstance(edits, list):
+            edits = []
+        for edit in edits:
+            if not isinstance(edit, dict):
+                continue
             blocks.append(
                 f'<<<FIND>>>\n{edit.get("find", "")}\n<<<REPLACE>>>\n{edit.get("replace", "")}\n<<<END>>>'
             )
         content = "\n".join(blocks)
     elif tool_type == "suggest_document":
         blocks = []
-        for s in args.get("suggestions", []):
+        suggestions = args.get("suggestions", [])
+        if not isinstance(suggestions, list):
+            suggestions = []
+        for s in suggestions:
+            if not isinstance(s, dict):
+                continue
             blocks.append(
                 f'<<<FIND>>>\n{s.get("find", "")}\n<<<SUGGEST>>>\n{s.get("replace", "")}\n<<<REASON>>>\n{s.get("reason", "")}\n<<<END>>>'
             )
@@ -1167,15 +1430,20 @@ def function_call_to_tool_block(name: str, arguments: str) -> Optional[ToolBlock
     elif tool_type == "manage_memory":
         action = args.get("action", "")
         if action == "add":
-            content = "add\n" + args.get("text", "")
+            text = args.get("text") or args.get("value") or args.get("content") or ""
+            if not text and args.get("key"):
+                text = str(args.get("key") or "")
+            content = "add\n" + str(text)
             if args.get("category"):
                 content += "\n" + args["category"]
+            elif args.get("key"):
+                content += "\n" + str(args["key"])
         elif action == "edit":
             content = "edit\n" + args.get("memory_id", "") + "\n" + args.get("text", "")
         elif action == "delete":
             content = "delete\n" + args.get("memory_id", "")
         elif action == "search":
-            content = "search\n" + args.get("text", "")
+            content = "search\n" + (args.get("text") or args.get("tex") or args.get("query") or "")
         elif action == "list":
             content = "list"
             if args.get("category"):
@@ -1197,6 +1465,9 @@ def function_call_to_tool_block(name: str, arguments: str) -> Optional[ToolBlock
             folder = args.get("folder") or value or "INBOX"
             mode = args.get("mode") or "reply"
             content = f"open_email_reply {uid} {folder} {mode}"
+            body = args.get("body") or args.get("extra") or args.get("content") or ""
+            if body:
+                content += f" {body}"
         elif action == "set_mode":
             content = f"set_mode {value or name}"
         elif action == "switch_model":
@@ -1230,6 +1501,12 @@ def function_call_to_tool_block(name: str, arguments: str) -> Optional[ToolBlock
         content = json.dumps(args)
     elif tool_type == "ask_teacher":
         content = args.get("model", "auto") + "\n" + args.get("problem", "")
+    elif tool_type == "ask_user":
+        # Keep user-facing labels readable in the tool trace.  The outer SSE
+        # JSON encoder will escape them for transport and JSON.parse restores
+        # them once; pre-escaping here caused literal ``\u00f1`` sequences to
+        # remain visible in the debug panel.
+        content = json.dumps(args, ensure_ascii=False)
     else:
         content = json.dumps(args)
 
