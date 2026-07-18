@@ -882,6 +882,7 @@ def setup_chat_routes(
         ):
             disabled_tools.add("web_search")
             disabled_tools.add("web_fetch")
+        _explicit_web_intent = bool(_tool_intent and _tool_intent.category == "web")
         if _explicit_web_intent:
             # A direct lookup/search request should not drift into personal
             # tools or shell fallbacks. We still keep web_search/web_fetch
