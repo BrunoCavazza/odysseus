@@ -640,6 +640,11 @@ def _build_ollama_payload(
     if max_tokens and max_tokens > 0:
         options["num_predict"] = max_tokens
     if num_ctx is not None and num_ctx > 0 and num_ctx != DEFAULT_CONTEXT:
+        # Cap the KV-cache window: a model advertising 128K+ would not fit
+        # this host's VRAM and silently falls back to CPU (~4 tok/s).
+        _ctx_cap = int(os.getenv("ODYSSEUS_OLLAMA_NUM_CTX_MAX", "0") or 0)
+        if _ctx_cap > 0:
+            num_ctx = min(num_ctx, _ctx_cap)
         options["num_ctx"] = num_ctx
     if options:
         payload["options"] = options
@@ -2006,8 +2011,11 @@ async def llm_call_async(
             tok_key = "max_completion_tokens" if _uses_max_completion_tokens(model) else "max_tokens"
             payload[tok_key] = max_tokens
         # Suppress thinking for qwen3/gemma4 on Ollama /v1 — same as stream_llm.
+        # Ollama's /v1 surface ignores the "think" param (native-API only);
+        # what it does honor is OpenAI-style reasoning_effort, so send both.
         if _is_ollama_openai_compat_url(url) and _supports_thinking(model):
             payload["think"] = False
+            payload["reasoning_effort"] = "none"
         if provider == "mistral" and _supports_thinking(model):
             payload["reasoning_effort"] = _MISTRAL_REASONING_EFFORT
         _apply_local_cache_affinity(payload, url, session_id)
@@ -2175,9 +2183,11 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
             payload["reasoning_effort"] = _MISTRAL_REASONING_EFFORT
         # For Ollama's OpenAI-compat /v1 endpoint with thinking models (qwen3,
         # gemma4, etc.), suppress thinking so tool calls aren't swallowed inside
-        # <think> blocks. Ollama /v1 accepts "think": false as a top-level param.
+        # <think> blocks. Ollama /v1 ignores "think" (native-API only) but
+        # honors OpenAI-style reasoning_effort, so send both.
         if _is_ollama_openai_compat_url(url) and _supports_thinking(model):
             payload["think"] = False
+            payload["reasoning_effort"] = "none"
         _apply_local_cache_affinity(payload, url, session_id)
         _apply_local_generation_stability(payload, target_url, model)
         h = _provider_headers(provider, headers)
