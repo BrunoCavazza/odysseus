@@ -645,6 +645,11 @@ def _build_ollama_payload(
         payload["options"] = options
     if tools:
         payload["tools"] = tools
+    # Suppress thinking for qwen3/gemma4 etc. on Ollama native /api/chat —
+    # same policy as the /v1 branches (see stream_llm), otherwise reasoning
+    # models burn tokens thinking and leak it into the chat stream.
+    if _supports_thinking(model):
+        payload["think"] = False
     return payload
 
 
