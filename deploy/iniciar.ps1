@@ -14,7 +14,9 @@ $sitesFile = "D:\Archivos\Proyectos\Razzia\deploy\caddy\sites.txt"
 
 $appPort = 7000
 $ollamaPort = 11434
+$logsDir = Join-Path $projectRoot "deploy\logs"
 
+New-Item -ItemType Directory -Force -Path $logsDir | Out-Null
 Set-Location $projectRoot
 
 function Test-PortListening([int]$Port) {
@@ -43,7 +45,9 @@ if (Test-PortListening $ollamaPort) {
     New-Item -ItemType Directory -Force -Path $ollamaModels | Out-Null
 
     $proc = Start-Process -FilePath $ollamaExe -ArgumentList "serve" `
-        -WorkingDirectory $ollamaDir -WindowStyle Hidden -PassThru
+        -WorkingDirectory $ollamaDir -WindowStyle Hidden -PassThru `
+        -RedirectStandardOutput (Join-Path $logsDir "ollama.out.log") `
+        -RedirectStandardError (Join-Path $logsDir "ollama.err.log")
     Set-Content -Path $ollamaPidFile -Value $proc.Id -Encoding ascii
 
     if (Wait-ForPort $ollamaPort 90) {
@@ -65,7 +69,9 @@ if (Test-PortListening $appPort) {
 } else {
     $proc = Start-Process -FilePath $venvPy `
         -ArgumentList "-m", "uvicorn", "app:app", "--host", "127.0.0.1", "--port", "$appPort" `
-        -WorkingDirectory $projectRoot -WindowStyle Hidden -PassThru
+        -WorkingDirectory $projectRoot -WindowStyle Hidden -PassThru `
+        -RedirectStandardOutput (Join-Path $logsDir "odysseus.out.log") `
+        -RedirectStandardError (Join-Path $logsDir "odysseus.err.log")
     Set-Content -Path $appPidFile -Value $proc.Id -Encoding ascii
 
     if (Wait-ForPort $appPort 60) {
@@ -114,11 +120,8 @@ if (Test-Path $sitesFile) {
 }
 
 if (-not $odysseusDomain) {
-    Write-Host "Sin dominio para Odysseus todavia. Para acceso remoto:" -ForegroundColor Yellow
-    Write-Host "  1. Crea un tunel nuevo en https://playit.gg (TCP, puerto local 443)" -ForegroundColor Yellow
-    Write-Host "  2. Agrega en $sitesFile la linea:" -ForegroundColor Yellow
-    Write-Host "     TU-DOMINIO.playit.gg $appPort" -ForegroundColor Yellow
-    Write-Host "  3. Volve a iniciar Odysseus desde Launchpad" -ForegroundColor Yellow
+    Write-Host "Acceso remoto: via tunel playit (http://bc-odysseus.playit.plus:1128)" -ForegroundColor Green
+    Write-Host "(Para HTTPS via Caddy: agregar 'dominio $appPort' en sites.txt)" -ForegroundColor DarkGray
 } elseif (Test-Path $caddyScript) {
     & powershell -NoProfile -ExecutionPolicy Bypass -File $caddyScript
 } else {
