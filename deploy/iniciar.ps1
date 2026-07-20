@@ -120,8 +120,7 @@ if (Test-Path $sitesFile) {
 }
 
 if (-not $odysseusDomain) {
-    Write-Host "Acceso remoto: via tunel playit (http://bc-odysseus.playit.plus:1128)" -ForegroundColor Green
-    Write-Host "(Para HTTPS via Caddy: agregar 'dominio $appPort' en sites.txt)" -ForegroundColor DarkGray
+    Write-Host "Sin dominio en sites.txt: agregar 'dominio $appPort' para HTTPS via Caddy" -ForegroundColor Yellow
 } elseif (Test-Path $caddyScript) {
     & powershell -NoProfile -ExecutionPolicy Bypass -File $caddyScript
 } else {
